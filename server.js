@@ -3,11 +3,18 @@ const multer = require("multer");
 const fs = require("fs");
 const path = require("path");
 const { execSync, exec } = require("child_process");
-const https = require("https");
 const crypto = require("crypto");
 
 const app = express();
 app.use(express.json());
+
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Headers", "x-api-key, Content-Type");
+  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  if (req.method === "OPTIONS") return res.status(200).end();
+  next();
+});
 
 const CONFIG = {
   SERVER_URL: process.env.SERVER_URL || "https://ton-serveur.com",
@@ -15,8 +22,6 @@ const CONFIG = {
   CERT_DIR: "./uploads/certs",
   SIGNED_DIR: "./uploads/signed",
   PLIST_DIR: "./uploads/plists",
-  SSL_CERT: process.env.SSL_CERT || "./ssl/cert.pem",
-  SSL_KEY: process.env.SSL_KEY || "./ssl/key.pem",
   API_KEY: process.env.API_KEY || "change-moi-en-production",
   PORT: process.env.PORT || 3000,
 };
@@ -78,121 +83,4 @@ const generatePlist = (appId, ipaUrl, bundleId, version, name) => `<?xml version
       </array>
       <key>metadata</key>
       <dict>
-        <key>bundle-identifier</key><string>${bundleId}</string>
-        <key>bundle-version</key><string>${version}</string>
-        <key>kind</key><string>software</string>
-        <key>title</key><string>${name}</string>
-      </dict>
-    </dict>
-  </array>
-</dict>
-</plist>`;
-
-app.get("/health", (req, res) => res.json({ status: "ok" }));
-
-app.post("/api/apps/upload", auth, upload.single("ipa"), (req, res) => {
-  if (!req.file) return res.status(400).json({ error: "Aucun .ipa reçu" });
-  const db = loadDB();
-  const entry = {
-    id: crypto.randomUUID(),
-    name: req.body.name || req.file.originalname.replace(".ipa", ""),
-    version: req.body.version || "1.0.0",
-    bundleId: req.body.bundleId || "com.example.app",
-    filename: req.file.filename,
-    size: req.file.size,
-    uploadedAt: new Date().toISOString(),
-    certId: null, profileId: null, signed: false,
-  };
-  db.apps.push(entry);
-  saveDB(db);
-  res.json({ success: true, app: entry });
-});
-
-app.post("/api/certs/upload", auth, upload.single("file"), (req, res) => {
-  if (!req.file) return res.status(400).json({ error: "Aucun fichier reçu" });
-  const isP12 = req.file.originalname.endsWith(".p12");
-  const db = loadDB();
-  const entry = {
-    id: crypto.randomUUID(),
-    name: req.body.name || req.file.originalname,
-    type: isP12 ? "p12" : "mobileprovision",
-    filename: req.file.filename,
-    password: req.body.password || "",
-    expiry: req.body.expiry || null,
-    uploadedAt: new Date().toISOString(),
-  };
-  if (isP12) db.certs.push(entry);
-  else db.profiles.push(entry);
-  saveDB(db);
-  res.json({ success: true, entry });
-});
-
-app.post("/api/apps/:id/assign", auth, (req, res) => {
-  const db = loadDB();
-  const app = db.apps.find(a => a.id === req.params.id);
-  if (!app) return res.status(404).json({ error: "App non trouvée" });
-  app.certId = req.body.certId;
-  app.profileId = req.body.profileId;
-  app.signed = false;
-  saveDB(db);
-  res.json({ success: true, app });
-});
-
-app.post("/api/apps/:id/sign", auth, async (req, res) => {
-  const db = loadDB();
-  const app = db.apps.find(a => a.id === req.params.id);
-  if (!app) return res.status(404).json({ error: "App non trouvée" });
-  const cert = db.certs.find(c => c.id === app.certId);
-  const profile = db.profiles.find(p => p.id === app.profileId);
-  if (!cert) return res.status(400).json({ error: "Aucun certificat associé" });
-  if (!profile) return res.status(400).json({ error: "Aucun profil associé" });
-
-  const ipaPath = path.join(CONFIG.UPLOAD_DIR, app.filename);
-  const certPath = path.join(CONFIG.CERT_DIR, cert.filename);
-  const profilePath = path.join(CONFIG.CERT_DIR, profile.filename);
-  const signedFilename = `signed_${app.id}.ipa`;
-  const signedPath = path.join(CONFIG.SIGNED_DIR, signedFilename);
-
-  try {
-    await resignIPA(ipaPath, certPath, cert.password, profilePath, signedPath);
-    const plistFilename = `${app.id}.plist`;
-    const plistPath = path.join(CONFIG.PLIST_DIR, plistFilename);
-    const ipaUrl = `${CONFIG.SERVER_URL}/download/${signedFilename}`;
-    fs.writeFileSync(plistPath, generatePlist(app.id, ipaUrl, app.bundleId, app.version, app.name));
-    app.signed = true;
-    app.signedFilename = signedFilename;
-    app.plistFilename = plistFilename;
-    saveDB(db);
-    const installUrl = `itms-services://?action=download-manifest&url=${encodeURIComponent(`${CONFIG.SERVER_URL}/plist/${plistFilename}`)}`;
-    res.json({ success: true, app, installUrl });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.get("/api/apps", auth, (req, res) => res.json(loadDB().apps));
-app.get("/api/certs", auth, (req, res) => { const db = loadDB(); res.json({ certs: db.certs, profiles: db.profiles }); });
-
-app.get("/download/:filename", (req, res) => {
-  const filePath = path.join(CONFIG.SIGNED_DIR, req.params.filename);
-  if (!fs.existsSync(filePath)) return res.status(404).send("Fichier non trouvé");
-  res.download(filePath);
-});
-
-app.get("/plist/:filename", (req, res) => {
-  const filePath = path.join(CONFIG.PLIST_DIR, req.params.filename);
-  if (!fs.existsSync(filePath)) return res.status(404).send("Plist non trouvé");
-  res.setHeader("Content-Type", "application/xml");
-  res.sendFile(path.resolve(filePath));
-});
-
-app.get("/install/:appId", (req, res) => {
-  const db = loadDB();
-  const app = db.apps.find(a => a.id === req.params.appId);
-  if (!app || !app.signed) return res.status(404).send("App non disponible");
-  const plistUrl = `${CONFIG.SERVER_URL}/plist/${app.plistFilename}`;
-  const installUrl = `itms-services://?action=download-manifest&url=${encodeURIComponent(plistUrl)}`;
-  res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Installer ${app.name}</title><style>body{font-family:-apple-system,sans-serif;max-width:400px;margin:60px auto;text-align:center;padding:20px}.card{background:#fff;border-radius:20px;padding:30px;box-shadow:0 4px 20px rgba(0,0,0,.1)}a.btn{display:inline-block;margin-top:20px;padding:16px 32px;background:#111;color:#fff;border-radius:14px;text-decoration:none;font-weight:700}</style></head><body><div class="card"><h1>${app.name}</h1><p>v${app.version}</p><img src="https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(installUrl)}&size=200x200" style="border-radius:12px;margin:20px 0"><p>Scanne depuis Safari ou appuie ci-dessous</p><a href="${installUrl}" class="btn">📲 Installer</a></div></body></html>`);
-});
-
-app.listen(CONFIG.PORT, () => console.log(`Serveur démarré sur le port ${CONFIG.PORT}`));
+        <key>bundle-identifier​​​​​​​​​​​​​​​​
