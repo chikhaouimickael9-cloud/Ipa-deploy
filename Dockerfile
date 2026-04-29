@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y \
 RUN git clone https://github.com/zhlynn/zsign.git /zsign && \
     cd /zsign/build/linux && \
     make && \
-    cp zsign /usr/local/bin/ && \
+    cp /zsign/bin/zsign /usr/local/bin/ && \
     chmod +x /usr/local/bin/zsign
 
 WORKDIR /app
